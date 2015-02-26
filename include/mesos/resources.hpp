@@ -21,11 +21,16 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include <mesos/mesos.hpp>
 #include <mesos/values.hpp>
 
 #include <stout/bytes.hpp>
+#include <stout/check.hpp>
+#include <stout/error.hpp>
+#include <stout/foreach.hpp>
+#include <stout/lambda.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
@@ -81,13 +86,31 @@ public:
   static Option<Error> validate(
       const google::protobuf::RepeatedPtrField<Resource>& resources);
 
+  // NOTE: The following predicate functions assume that the given
+  // resource is validated.
+
   // Tests if the given Resource object is empty.
-  static bool empty(const Resource& resource);
+  static bool isEmpty(const Resource& resource);
+
+  // Tests if the given Resource object is a persistent volume.
+  static bool isPersistentVolume(const Resource& resource);
+
+  // Tests if the given Resource object is reserved. If the role is
+  // specified, tests that it's reserved for the given role.
+  static bool isReserved(
+      const Resource& resource,
+      const Option<std::string>& role = None());
+
+  // Tests if the given Resource object is unreserved.
+  static bool isUnreserved(const Resource& resource);
 
   Resources() {}
 
   // TODO(jieyu): Consider using C++11 initializer list.
   /*implicit*/ Resources(const Resource& resource);
+
+  /*implicit*/
+  Resources(const std::vector<Resource>& _resources);
 
   /*implicit*/
   Resources(const google::protobuf::RepeatedPtrField<Resource>& _resources);
@@ -107,9 +130,25 @@ public:
   // Checks if this Resources is a superset of the given Resources.
   bool contains(const Resources& that) const;
 
-  // Returns all resources in this object that are marked with the
-  // specified role.
-  Resources extract(const std::string& role) const;
+  // Checks if this Resources contains the given Resource.
+  bool contains(const Resource& that) const;
+
+  // Filter resources based on the given predicate.
+  Resources filter(
+      const lambda::function<bool(const Resource&)>& predicate) const;
+
+  // Returns the reserved resources, by role.
+  hashmap<std::string, Resources> reserved() const;
+
+  // Returns the reserved resources for the role. Note that the "*"
+  // role represents unreserved resources, and will be ignored.
+  Resources reserved(const std::string& role) const;
+
+  // Returns the unreserved resources.
+  Resources unreserved() const;
+
+  // Returns the persistent volumes.
+  Resources persistentVolumes() const;
 
   // Returns a Resources object with the same amount of each resource
   // type as these Resources, but with all Resource objects marked as
@@ -127,6 +166,30 @@ public:
   // consider moving this to an internal "allocation" library for our
   // example frameworks to leverage.
   Option<Resources> find(const Resources& targets) const;
+
+  // Certain offer operations (e.g., RESERVE, UNRESERVE, CREATE or
+  // DESTROY) alter the offered resources. The following methods
+  // provide a convenient way to get the transformed resources by
+  // applying the given offer operation(s). Returns an Error if the
+  // offer operation(s) cannot be applied.
+  Try<Resources> apply(const Offer::Operation& operation) const;
+
+  template <typename Iterable>
+  Try<Resources> apply(const Iterable& operations) const
+  {
+    Resources result = *this;
+
+    foreach (const Offer::Operation& operation, operations) {
+      Try<Resources> transformed = result.apply(operation);
+      if (transformed.isError()) {
+        return Error(transformed.error());
+      }
+
+      result = transformed.get();
+    }
+
+    return result;
+  }
 
   // Helpers to get resource values. We consider all roles here.
   template <typename T>
@@ -181,7 +244,14 @@ public:
   Resources& operator -= (const Resources& that);
 
 private:
-  bool contains(const Resource& that) const;
+  // Similar to 'contains(const Resource&)' but skips the validity
+  // check. This can be used to avoid the performance overhead of
+  // calling 'contains(const Resource&)' when the resource can be
+  // assumed valid (e.g. it's inside a Resources).
+  //
+  // TODO(jieyu): Measure performance overhead of validity check to
+  // ensure this is warranted.
+  bool _contains(const Resource& that) const;
 
   // Similar to the public 'find', but only for a single Resource
   // object. The target resource may span multiple roles, so this

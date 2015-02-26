@@ -26,6 +26,7 @@
 
 #include <stout/foreach.hpp>
 #include <stout/os.hpp>
+#include <stout/path.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
@@ -43,50 +44,73 @@ using lambda::function;
 
 
 WhitelistWatcher::WhitelistWatcher(
-    const string& path,
+    const Option<Path>& path,
     const Duration& watchInterval,
-    const function<
-      void(const Option<hashset<string>>& whitelist)>& subscriber)
+    const function<void(const Option<hashset<string>>& whitelist)>& subscriber,
+    const Option<hashset<std::string>>& initialWhitelist)
   : ProcessBase(process::ID::generate("whitelist")),
     path(path),
     watchInterval(watchInterval),
-    subscriber(subscriber) {}
+    subscriber(subscriber),
+    lastWhitelist(initialWhitelist) {}
 
 
 void WhitelistWatcher::initialize()
 {
-  watch();
+  // If no whitelist file is given (loaded whitelist is in state
+  // (1) absent), then there is no need to watch. In case the
+  // subscriber's initial policy was not permissive (initial
+  // whitelist is not in (1) absent), notify the subscriber that
+  // there is no whitelist any more.
+  //
+  // TODO(cmaloney): In older versions of Mesos the default value for
+  // 'whitelist' which represented "accept all nodes" was the string
+  // value '*' rather than 'None'. For backwards compatibility we
+  // still check for '*'. Can be removed after 0.23.
+  if (path.isSome() && path.get().value == "*") {
+    LOG(WARNING)
+      << "Explicitly specifying '*' for the whitelist in order to "
+      << "\"accept all\" is deprecated and will be removed in a future "
+      << "release; simply don't specify the whitelist flag in order to "
+      << "\"accept all\" slaves";
+  }
+
+  if (path.isNone() || path.get().value == "*") { // Accept all nodes.
+    VLOG(1) << "No whitelist given";
+    if (lastWhitelist.isSome()) {
+      subscriber(None());
+    }
+  } else {
+    watch();
+  }
 }
 
 
 void WhitelistWatcher::watch()
 {
-  // Get the list of white listed nodes.
+  // Read the list of white listed nodes from local file.
+  // TODO(vinod): Add support for reading from ZooKeeper.
+  // TODO(vinod): Ensure this read is atomic w.r.t external
+  // writes/updates to this file.
   Option<hashset<string>> whitelist;
-  if (path == "*") { // Accept all nodes.
-    VLOG(1) << "No whitelist given";
+
+  CHECK_SOME(path);
+  Try<string> read = os::read(path.get().value);
+
+  if (read.isError()) {
+    LOG(ERROR) << "Error reading whitelist file: " << read.error() << ". "
+               << "Retrying";
+    whitelist = lastWhitelist;
+  } else if (read.get().empty()) {
+    VLOG(1) << "Empty whitelist file " << path.get().value;
+    whitelist = hashset<string>();
   } else {
-    // Read from local file.
-    // TODO(vinod): Add support for reading from ZooKeeper.
-    // TODO(vinod): Ensure this read is atomic w.r.t external
-    // writes/updates to this file.
-    Try<string> read = os::read(
-        strings::remove(path, "file://", strings::PREFIX));
-    if (read.isError()) {
-      LOG(ERROR) << "Error reading whitelist file: " << read.error() << ". "
-                 << "Retrying";
-      whitelist = lastWhitelist;
-    } else if (read.get().empty()) {
-      VLOG(1) << "Empty whitelist file " << path;
-      whitelist = hashset<string>();
-    } else {
-      hashset<string> hostnames;
-      vector<string> lines = strings::tokenize(read.get(), "\n");
-      foreach (const string& hostname, lines) {
-        hostnames.insert(hostname);
-      }
-      whitelist = hostnames;
+    hashset<string> hostnames;
+    vector<string> lines = strings::tokenize(read.get(), "\n");
+    foreach (const string& hostname, lines) {
+      hostnames.insert(hostname);
     }
+    whitelist = hostnames;
   }
 
   // Send the whitelist to subscriber, if necessary.

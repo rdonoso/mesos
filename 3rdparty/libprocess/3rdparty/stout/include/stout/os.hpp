@@ -82,6 +82,7 @@
 #include <stout/os/permissions.hpp>
 #include <stout/os/pstree.hpp>
 #include <stout/os/read.hpp>
+#include <stout/os/rename.hpp>
 #include <stout/os/sendfile.hpp>
 #include <stout/os/shell.hpp>
 #include <stout/os/signals.hpp>
@@ -225,8 +226,10 @@ inline Try<Nothing> utime(const std::string& path)
 inline Try<Nothing> touch(const std::string& path)
 {
   if (!exists(path)) {
-    Try<int> fd =
-      open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+    Try<int> fd = open(
+        path,
+        O_RDWR | O_CREAT,
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
     if (fd.isError()) {
       return Error("Failed to open file: " + fd.error());
@@ -293,8 +296,11 @@ inline Try<Nothing> write(int fd, const std::string& message)
 // open and closing the file.
 inline Try<Nothing> write(const std::string& path, const std::string& message)
 {
-  Try<int> fd = os::open(path, O_WRONLY | O_CREAT | O_TRUNC,
-                         S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+  Try<int> fd = os::open(
+      path,
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
   if (fd.isError()) {
     return ErrnoError("Failed to open file '" + path + "'");
   }
@@ -854,41 +860,6 @@ inline Result<std::string> user(Option<uid_t> uid = None())
       delete[] buffer;
     }
   }
-}
-
-
-inline Try<std::string> hostname()
-{
-  char host[512];
-
-  if (gethostname(host, sizeof(host)) < 0) {
-    return ErrnoError();
-  }
-
-  // Allocate temporary buffer for gethostbyname2_r.
-  size_t length = 1024;
-  char* temp = new char[length];
-
-  struct hostent he, *hep = NULL;
-  int result = 0;
-  int herrno = 0;
-
-  while ((result = gethostbyname2_r(host, AF_INET, &he, temp,
-                                    length, &hep, &herrno)) == ERANGE) {
-    // Enlarge the buffer.
-    delete[] temp;
-    length *= 2;
-    temp = new char[length];
-  }
-
-  if (result != 0 || hep == NULL) {
-    delete[] temp;
-    return Error(hstrerror(herrno));
-  }
-
-  std::string hostname = hep->h_name;
-  delete[] temp;
-  return hostname;
 }
 
 

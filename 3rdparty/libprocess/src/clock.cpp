@@ -1,9 +1,8 @@
-#include <ev.h>
-
 #include <glog/logging.h>
 
 #include <list>
 #include <map>
+#include <set>
 
 #include <process/clock.hpp>
 #include <process/pid.hpp>
@@ -17,31 +16,20 @@
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
 
+#include "event_loop.hpp"
 #include "synchronized.hpp"
 
 using std::list;
 using std::map;
+using std::set;
 
 namespace process {
-
-// Event loop.
-extern struct ev_loop* loop;
-
-// Asynchronous watcher for interrupting loop to specifically deal
-// with updating timers.
-static ev_async async_update_timer_watcher;
-
-// Watcher for timeouts.
-static ev_timer timeouts_watcher;
 
 // We store the timers in a map of lists indexed by the timeout of the
 // timer so that we can have two timers that have the same timeout. We
 // exploit that the map is SORTED!
-static map<Time, list<Timer>>* timeouts = new map<Time, list<Timer>>();
-static synchronizable(timeouts) = SYNCHRONIZED_INITIALIZER_RECURSIVE;
-
-// Flag to indicate whether or to update the timer on async interrupt.
-static bool update_timer = false;
+static map<Time, list<Timer>>* timers = new map<Time, list<Timer>>();
+static synchronizable(timers) = SYNCHRONIZED_INITIALIZER_RECURSIVE;
 
 
 // We namespace the clock related variables to keep them well
@@ -52,12 +40,10 @@ namespace clock {
 
 map<ProcessBase*, Time>* currents = new map<ProcessBase*, Time>();
 
-// TODO(dhamon): These static non-POD instances should be replaced by pointers
-// or functions.
-Time initial = Time::epoch();
-Time current = Time::epoch();
+Time* initial = new Time(Time::epoch());
+Time* current = new Time(Time::epoch());
 
-Duration advanced = Duration::zero();
+Duration* advanced = new Duration(Duration::zero());
 
 bool paused = false;
 
@@ -67,53 +53,88 @@ bool paused = false;
 bool settling = false;
 
 // Lambda function to invoke when timers have expired.
-lambda::function<void(list<Timer>&&)> callback;
+lambda::function<void(const list<Timer>&)>* callback =
+    new lambda::function<void(const list<Timer>&)>();
 
-} // namespace clock {
+// Keep track of 'ticks' that have been scheduled. To reduce the
+// number of outstanding delays on the EventLoop system, we only
+// schedule a _new_ 'tick' when it's earlier than all currently
+// scheduled 'ticks'.
+set<Time>* ticks = new set<Time>();
 
 
-void handle_async_update_timer(struct ev_loop* loop, ev_async* _, int revents)
+// Helper for determining the time when the next timer elapses,
+// or None if no timers are pending, or the clock is paused and no
+// timers are expired. Note that we don't manipulate 'timers' directly
+// so that it's clear from the callsite that the use of 'timers' is
+// within a 'synchronized' block.
+//
+// TODO(benh): Create a generic 'Timers' abstraction which hides this
+// and more away (i.e., all manipulations of 'timers' below).
+Option<Time> next(const map<Time, list<Timer>>& timers)
 {
-  synchronized (timeouts) {
-    if (update_timer) {
-      if (!timeouts->empty()) {
-        // Determine when the next timer should fire.
-        timeouts_watcher.repeat =
-          (timeouts->begin()->first - Clock::now()).secs();
+  if (!timers.empty()) {
+    Time first = timers.begin()->first;
 
-        if (timeouts_watcher.repeat <= 0) {
-          // Feed the event now!
-          timeouts_watcher.repeat = 0;
-          ev_timer_again(loop, &timeouts_watcher);
-          ev_feed_event(loop, &timeouts_watcher, EV_TIMEOUT);
-        } else {
-          // Don't fire the timer if the clock is paused since we
-          // don't want time to advance (instead a call to
-          // clock::advance() will handle the timer).
-          if (Clock::paused() && timeouts_watcher.repeat > 0) {
-            timeouts_watcher.repeat = 0;
-          }
+    // If the clock is paused and no timers are expired, the
+    // timers cannot fire until the clock is advanced, so we
+    // return None() here. Note that we pass NULL to ensure
+    // that this looks at the global clock, since this can be
+    // called from a Process context through Clock::timer.
+    if (Clock::paused() && first > Clock::now(NULL)) {
+      return None();
+    }
 
-          ev_timer_again(loop, &timeouts_watcher);
-        }
-      }
+    return first;
+  }
 
-      update_timer = false;
+  return None();
+}
+
+
+// Forward declaration for scheduleTick.
+void tick(const Time& time);
+
+
+// Helper for scheduling the next clock tick, if applicable. Note
+// that we don't manipulate 'timers' or 'ticks' directly so that
+// it's clear from the callsite that this needs to be called within
+// a 'synchronized' block.
+// TODO(bmahler): Consider taking an optional 'now' to avoid
+// excessive syscalls via Clock::now(NULL).
+void scheduleTick(const map<Time, list<Timer>>& timers, set<Time>* ticks)
+{
+  // Determine when the next 'tick' should fire.
+  const Option<Time> next = clock::next(timers);
+
+  if (next.isSome()) {
+    // Don't schedule a 'tick' if there is a 'tick' scheduled for
+    // an earlier time, to avoid excessive pending timers.
+    if (ticks->empty() || next.get() < (*ticks->begin())) {
+      ticks->insert(next.get());
+
+      // The delay can be negative if the timer is expired, this
+      // is expected will result in a 'tick' firing immediately.
+      const Duration delay = next.get() - Clock::now(NULL);
+      EventLoop::delay(delay, lambda::bind(tick, next.get()));
     }
   }
 }
 
 
-void handle_timeouts(struct ev_loop* loop, ev_timer* _, int revents)
+void tick(const Time& time)
 {
-  list<Timer> timers;
+  list<Timer> timedout;
 
-  synchronized (timeouts) {
-    Time now = Clock::now();
+  synchronized (timers) {
+    // We pass NULL to be explicit about the fact that we want the
+    // global clock time, even though it's unnecessary ('tick' is
+    // called from the event loop, not a Process context).
+    Time now = Clock::now(NULL);
 
-    VLOG(3) << "Handling timeouts up to " << now;
+    VLOG(3) << "Handling timers up to " << now;
 
-    foreachkey (const Time& timeout, *timeouts) {
+    foreachkey (const Time& timeout, *timers) {
       if (timeout > now) {
         break;
       }
@@ -127,75 +148,47 @@ void handle_timeouts(struct ev_loop* loop, ev_timer* _, int revents)
         clock::settling = true;
       }
 
-      foreach (const Timer& timer, (*timeouts)[timeout]) {
-        timers.push_back(timer);
+      foreach (const Timer& timer, (*timers)[timeout]) {
+        timedout.push_back(timer);
       }
     }
 
-    // Now erase the range of timeouts that timed out.
-    timeouts->erase(timeouts->begin(), timeouts->upper_bound(now));
+    // Now erase the range of timers that timed out.
+    timers->erase(timers->begin(), timers->upper_bound(now));
 
     // Okay, so the timeout for the next timer should not have fired.
-    CHECK(timeouts->empty() || (timeouts->begin()->first > now));
+    CHECK(timers->empty() || (timers->begin()->first > now));
 
-    // Update the timer as necessary.
-    if (!timeouts->empty()) {
-      // Determine when the next timer should fire.
-      timeouts_watcher.repeat =
-        (timeouts->begin()->first - Clock::now()).secs();
+    // Remove this tick from the scheduled 'ticks', it may have
+    // been removed already if the clock was paused / manipulated
+    // in the interim.
+    ticks->erase(time);
 
-      if (timeouts_watcher.repeat <= 0) {
-        // Feed the event now!
-        timeouts_watcher.repeat = 0;
-        ev_timer_again(loop, &timeouts_watcher);
-        ev_feed_event(loop, &timeouts_watcher, EV_TIMEOUT);
-      } else {
-        // Don't fire the timer if the clock is paused since we don't
-        // want time to advance (instead a call to Clock::advance()
-        // will handle the timer).
-        if (Clock::paused() && timeouts_watcher.repeat > 0) {
-          timeouts_watcher.repeat = 0;
-        }
-
-        ev_timer_again(loop, &timeouts_watcher);
-      }
-    }
-
-    update_timer = false; // Since we might have a queued update_timer.
+    // Schedule another "tick" if necessary.
+    scheduleTick(*timers, ticks);
   }
 
-  clock::callback(std::move(timers));
+  (*clock::callback)(timedout);
 
-  // Mark 'settling' as false since there are not any more timeouts
+  // Mark 'settling' as false since there are not any more timers
   // that will expire before the paused time and we've finished
   // executing expired timers.
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused &&
-        (timeouts->size() == 0 ||
-         timeouts->begin()->first > clock::current)) {
+        (timers->size() == 0 ||
+         timers->begin()->first > *clock::current)) {
       VLOG(3) << "Clock has settled";
       clock::settling = false;
     }
   }
 }
 
+} // namespace clock {
 
-void Clock::initialize(lambda::function<void(list<Timer>&&)>&& callback)
+
+void Clock::initialize(lambda::function<void(const list<Timer>&)>&& callback)
 {
-  // TODO(benh): Currently this function is expected to get called
-  // just after initializing libev in process::initialize. But that is
-  // too tightly coupled so and we really need to move libev specific
-  // intialization outside of process::initialize that both
-  // process::initialize and Clock::initialize can depend on (and thus
-  // call).
-
-  clock::callback = callback;
-
-  ev_async_init(&async_update_timer_watcher, handle_async_update_timer);
-  ev_async_start(loop, &async_update_timer_watcher);
-
-  ev_timer_init(&timeouts_watcher, handle_timeouts, 0., 2100000.0);
-  ev_timer_again(loop, &timeouts_watcher);
+  (*clock::callback) = callback;
 }
 
 
@@ -207,22 +200,21 @@ Time Clock::now()
 
 Time Clock::now(ProcessBase* process)
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (Clock::paused()) {
       if (process != NULL) {
         if (clock::currents->count(process) != 0) {
           return (*clock::currents)[process];
         } else {
-          return (*clock::currents)[process] = clock::initial;
+          return (*clock::currents)[process] = *clock::initial;
         }
       } else {
-        return clock::current;
+        return *clock::current;
       }
     }
   }
 
-  // TODO(benh): Versus ev_now()?
-  double d = ev_time();
+  double d = EventLoop::time();
   Try<Time> time = Time::create(d); // Compensates for clock::advanced.
 
   // TODO(xujyan): Move CHECK_SOME to libprocess and add CHECK_SOME
@@ -252,17 +244,18 @@ Timer Clock::timer(
           << " in the future (" << timeout.time() << ")";
 
   // Add the timer.
-  synchronized (timeouts) {
-    if (timeouts->size() == 0 ||
-        timer.timeout().time() < timeouts->begin()->first) {
+  synchronized (timers) {
+    if (timers->size() == 0 ||
+        timer.timeout().time() < timers->begin()->first) {
       // Need to interrupt the loop to update/set timer repeat.
-      (*timeouts)[timer.timeout().time()].push_back(timer);
-      update_timer = true;
-      ev_async_send(loop, &async_update_timer_watcher);
+      (*timers)[timer.timeout().time()].push_back(timer);
+
+      // Schedule another "tick" if necessary.
+      clock::scheduleTick(*timers, clock::ticks);
     } else {
       // Timer repeat is adequate, just add the timeout.
-      CHECK(timeouts->size() >= 1);
-      (*timeouts)[timer.timeout().time()].push_back(timer);
+      CHECK(timers->size() >= 1);
+      (*timers)[timer.timeout().time()].push_back(timer);
     }
   }
 
@@ -273,16 +266,16 @@ Timer Clock::timer(
 bool Clock::cancel(const Timer& timer)
 {
   bool canceled = false;
-  synchronized (timeouts) {
+  synchronized (timers) {
     // Check if the timeout is still pending, and if so, erase it. In
     // addition, erase an empty list if we just removed the last
     // timeout.
     Time time = timer.timeout().time();
-    if (timeouts->count(time) > 0) {
+    if (timers->count(time) > 0) {
       canceled = true;
-      (*timeouts)[time].remove(timer);
-      if ((*timeouts)[time].empty()) {
-        timeouts->erase(time);
+      (*timers)[time].remove(timer);
+      if ((*timers)[time].empty()) {
+        timers->erase(time);
       }
     }
   }
@@ -293,19 +286,27 @@ bool Clock::cancel(const Timer& timer)
 
 void Clock::pause()
 {
-  process::initialize(); // To make sure the libev watchers are ready.
+  process::initialize(); // To make sure the event loop is ready.
 
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (!clock::paused) {
-      clock::initial = clock::current = now();
+      *clock::initial = *clock::current = now();
       clock::paused = true;
       VLOG(2) << "Clock paused at " << clock::initial;
+
+      // When the clock is paused, we clear the scheduled 'ticks'
+      // since they no longer accurately represent when a 'tick'
+      // will fire (our notion of "time" is now moving differently
+      // from that of the event loop). Note that only 'ticks'
+      // that fire immediately will be scheduled while the clock
+      // is paused.
+      clock::ticks->clear();
     }
   }
 
-  // Note that after pausing the clock an existing libev timer might
-  // still fire (invoking handle_timeout), but since paused == true no
-  // "time" will actually have passed, so no timer will actually fire.
+  // Note that after pausing the clock, the existing scheduled
+  // 'ticks' might still fire, but since 'paused' == true no "time"
+  // will actually have passed, so no timer will actually fire.
 }
 
 
@@ -317,16 +318,18 @@ bool Clock::paused()
 
 void Clock::resume()
 {
-  process::initialize(); // To make sure the libev watchers are ready.
+  process::initialize(); // To make sure the event loop is ready.
 
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused) {
       VLOG(2) << "Clock resumed at " << clock::current;
+
       clock::paused = false;
       clock::settling = false;
       clock::currents->clear();
-      update_timer = true;
-      ev_async_send(loop, &async_update_timer_watcher);
+
+      // Schedule another "tick" if necessary.
+      clock::scheduleTick(*timers, clock::ticks);
     }
   }
 }
@@ -334,15 +337,17 @@ void Clock::resume()
 
 void Clock::advance(const Duration& duration)
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused) {
-      clock::advanced += duration;
-      clock::current += duration;
+      *clock::advanced += duration;
+      *clock::current += duration;
+
       VLOG(2) << "Clock advanced ("  << duration << ") to " << clock::current;
-      if (!update_timer) {
-        update_timer = true;
-        ev_async_send(loop, &async_update_timer_watcher);
-      }
+
+      // Schedule another "tick" if necessary. Only "ticks" that
+      // fire immediately will be scheduled here, since the clock
+      // is paused.
+      clock::scheduleTick(*timers, clock::ticks);
     }
   }
 }
@@ -350,13 +355,18 @@ void Clock::advance(const Duration& duration)
 
 void Clock::advance(ProcessBase* process, const Duration& duration)
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused) {
       Time current = now(process);
       current += duration;
       (*clock::currents)[process] = current;
       VLOG(2) << "Clock of " << process->self() << " advanced (" << duration
               << ") to " << current;
+
+      // When the clock is advanced for a specific process, we do not
+      // need to schedule another "tick", as done in the global
+      // advance() above. This is because the clock ticks are based
+      // on global time, not per-Process time.
     }
   }
 }
@@ -364,16 +374,17 @@ void Clock::advance(ProcessBase* process, const Duration& duration)
 
 void Clock::update(const Time& time)
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused) {
-      if (clock::current < time) {
-        clock::advanced += (time - clock::current);
-        clock::current = Time(time);
+      if (*clock::current < time) {
+        *clock::advanced += (time - *clock::current);
+        *clock::current = Time(time);
         VLOG(2) << "Clock updated to " << clock::current;
-        if (!update_timer) {
-          update_timer = true;
-          ev_async_send(loop, &async_update_timer_watcher);
-        }
+
+        // Schedule another "tick" if necessary. Only "ticks" that
+        // fire immediately will be scheduled here, since the clock
+        // is paused.
+        clock::scheduleTick(*timers, clock::ticks);
       }
     }
   }
@@ -382,11 +393,16 @@ void Clock::update(const Time& time)
 
 void Clock::update(ProcessBase* process, const Time& time, Update update)
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     if (clock::paused) {
       if (now(process) < time || update == Clock::FORCE) {
         VLOG(2) << "Clock of " << process->self() << " updated to " << time;
         (*clock::currents)[process] = Time(time);
+
+        // When the clock is updated for a specific process, we do not
+        // need to schedule another "tick", as done in the global
+        // update() above. This is because the clock ticks are based
+        // on global time, not per-Process time.
       }
     }
   }
@@ -402,16 +418,14 @@ void Clock::order(ProcessBase* from, ProcessBase* to)
 
 bool Clock::settled()
 {
-  synchronized (timeouts) {
+  synchronized (timers) {
     CHECK(clock::paused);
 
-    if (update_timer) {
-      return false;
-    } else if (clock::settling) {
+    if (clock::settling) {
       VLOG(3) << "Clock still not settled";
       return false;
-    } else if (timeouts->size() == 0 ||
-               timeouts->begin()->first > clock::current) {
+    } else if (timers->size() == 0 ||
+               timers->begin()->first > *clock::current) {
       VLOG(3) << "Clock is settled";
       return true;
     }
@@ -431,7 +445,7 @@ Try<Time> Time::create(double seconds)
   Try<Duration> duration = Duration::create(seconds);
   if (duration.isSome()) {
     // In production code, clock::advanced will always be zero!
-    return Time(duration.get() + clock::advanced);
+    return Time(duration.get() + *clock::advanced);
   } else {
     return Error("Argument too large for Time: " + duration.error());
   }

@@ -22,11 +22,16 @@
 #include <list>
 #include <vector>
 
+#include <mesos/slave/isolator.hpp>
+
+#include <process/metrics/counter.hpp>
+
 #include <stout/hashmap.hpp>
 #include <stout/multihashmap.hpp>
 
+#include "slave/state.hpp"
+
 #include "slave/containerizer/containerizer.hpp"
-#include "slave/containerizer/isolator.hpp"
 #include "slave/containerizer/launcher.hpp"
 
 namespace mesos {
@@ -39,13 +44,17 @@ class MesosContainerizerProcess;
 class MesosContainerizer : public Containerizer
 {
 public:
-  static Try<MesosContainerizer*> create(const Flags& flags, bool local);
+  static Try<MesosContainerizer*> create(
+      const Flags& flags,
+      bool local,
+      Fetcher* fetcher);
 
   MesosContainerizer(
       const Flags& flags,
       bool local,
+      Fetcher* fetcher,
       const process::Owned<Launcher>& launcher,
-      const std::vector<process::Owned<Isolator>>& isolators);
+      const std::vector<process::Owned<mesos::slave::Isolator>>& isolators);
 
   // Used for testing.
   MesosContainerizer(const process::Owned<MesosContainerizerProcess>& _process);
@@ -100,10 +109,12 @@ public:
   MesosContainerizerProcess(
       const Flags& _flags,
       bool _local,
+      Fetcher* _fetcher,
       const process::Owned<Launcher>& _launcher,
-      const std::vector<process::Owned<Isolator>>& _isolators)
+      const std::vector<process::Owned<mesos::slave::Isolator>>& _isolators)
     : flags(_flags),
       local(_local),
+      fetcher(_fetcher),
       launcher(_launcher),
       isolators(_isolators) {}
 
@@ -151,10 +162,10 @@ public:
 
 private:
   process::Future<Nothing> _recover(
-      const std::list<state::RunState>& recoverable);
+      const std::list<mesos::slave::ExecutorRunState>& recoverable);
 
   process::Future<Nothing> __recover(
-      const std::list<state::RunState>& recovered);
+      const std::list<mesos::slave::ExecutorRunState>& recovered);
 
   process::Future<std::list<Option<CommandInfo>>> prepare(
       const ContainerID& containerId,
@@ -177,6 +188,11 @@ private:
       const process::PID<Slave>& slavePid,
       bool checkpoint,
       const std::list<Option<CommandInfo>>& scripts);
+
+  void __launch(
+      const ContainerID& containerId,
+      const ExecutorInfo& executorInfo,
+      const std::string& failure);
 
   process::Future<bool> isolate(
       const ContainerID& containerId,
@@ -206,16 +222,23 @@ private:
   // processes. This will trigger container destruction.
   void limited(
       const ContainerID& containerId,
-      const process::Future<Limitation>& future);
+      const process::Future<mesos::slave::Limitation>& future);
 
   // Call back for when the executor exits. This will trigger container
   // destroy.
   void reaped(const ContainerID& containerId);
 
+  // Updates volumes for the given container according to its current
+  // resources and the given updated resources.
+  Try<Nothing> updateVolumes(
+      const ContainerID& containerId,
+      const Resources& updated);
+
   const Flags flags;
   const bool local;
+  Fetcher* fetcher;
   const process::Owned<Launcher> launcher;
-  const std::vector<process::Owned<Isolator>> isolators;
+  const std::vector<process::Owned<mesos::slave::Isolator>> isolators;
 
   enum State
   {
@@ -243,20 +266,31 @@ private:
 
     // We keep track of any limitations received from each isolator so we can
     // determine the cause of an executor termination.
-    std::vector<Limitation> limitations;
-
-    // The mesos-fetcher subprocess, that we keep around so we can
-    // stop the fetcher when the container is destroyed.
-    Option<process::Subprocess> fetcher;
+    std::vector<mesos::slave::Limitation> limitations;
 
     // We keep track of the resources for each container so we can set the
     // ResourceStatistics limits in usage().
     Resources resources;
 
+    // The executor's working directory on the host.
+    std::string directory;
+
+    // The path to the container's rootfs, if full filesystem
+    // isolation is used.
+    Option<std::string> rootfs;
+
     State state;
   };
 
   hashmap<ContainerID, process::Owned<Container>> containers_;
+
+  struct Metrics
+  {
+    Metrics();
+    ~Metrics();
+
+    process::metrics::Counter container_destroy_errors;
+  } metrics;
 };
 
 } // namespace slave {

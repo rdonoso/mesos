@@ -56,10 +56,6 @@
 #include "tests/mesos.hpp"
 #include "tests/utils.hpp"
 
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
-
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::GarbageCollector;
@@ -79,6 +75,10 @@ using testing::_;
 using testing::AtMost;
 using testing::Return;
 using testing::SaveArg;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 class GarbageCollectorTest : public TemporaryDirectoryTest {};
 
@@ -458,7 +458,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
 
   ASSERT_FALSE(os::exists(frameworkDir));
 
-  process::UPID filesUpid("files", process::node());
+  process::UPID filesUpid("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(filesUpid, "browse.json", "path=" + frameworkDir));
@@ -559,7 +559,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::node());
+  process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -674,7 +674,7 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::node());
+  process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -818,3 +818,7 @@ TEST_F(GarbageCollectorIntegrationTest, Unschedule)
 
   Shutdown(); // Must shutdown before 'isolator' gets deallocated.
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

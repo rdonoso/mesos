@@ -24,6 +24,8 @@
 
 #include <boost/array.hpp>
 
+#include <mesos/type_utils.hpp>
+
 #include <process/help.hpp>
 
 #include <process/metrics/metrics.hpp>
@@ -45,7 +47,6 @@
 #include "common/build.hpp"
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
-#include "common/type_utils.hpp"
 
 #include "logging/logging.hpp"
 
@@ -279,8 +280,14 @@ Future<Response> Master::Http::observe(const Request& request)
 {
   LOG(INFO) << "HTTP request for '" << request.path << "'";
 
-  hashmap<string, string> values =
-    process::http::query::parse(request.body);
+  Try<hashmap<string, string>> decode =
+    process::http::query::decode(request.body);
+
+  if (decode.isError()) {
+    return BadRequest("Unable to decode query string: " + decode.error());
+  }
+
+  hashmap<string, string> values = decode.get();
 
   // Build up a JSON object of the values we recieved and send them back
   // down the wire as JSON for validation / confirmation.
@@ -358,6 +365,32 @@ Future<Response> Master::Http::redirect(const Request& request)
 
   return TemporaryRedirect(
       "http://" + hostname.get() + ":" + stringify(info.port()));
+}
+
+
+const string Master::Http::SLAVES_HELP = HELP(
+    TLDR(
+        "Information about registered slaves."),
+    USAGE(
+        "/master/slaves"),
+    DESCRIPTION(
+        "This endpoint shows information about the slaves registered in",
+        "this master formated as a json object."));
+
+
+Future<Response> Master::Http::slaves(const Request& request) {
+  LOG(INFO) << "HTTP request for '" << request.path << "'";
+
+  JSON::Array array;
+  foreachvalue (const Slave* slave, master->slaves.registered) {
+    JSON::Object object = model(*slave);
+    array.values.push_back(object);
+  }
+
+  JSON::Object object;
+  object.values["slaves"] = array;
+
+  return OK(object, request.query.get("jsonp"));
 }
 
 
@@ -530,6 +563,10 @@ Future<Response> Master::Http::state(const Request& request)
     object.values["log_dir"] = master->flags.log_dir.get();
   }
 
+  if (master->flags.external_log_file.isSome()) {
+    object.values["external_log_file"] = master->flags.external_log_file.get();
+  }
+
   JSON::Object flags;
   foreachpair (const string& name, const flags::Flag& flag, master->flags) {
     Option<string> value = flag.stringify(master->flags);
@@ -652,8 +689,14 @@ Future<Response> Master::Http::shutdown(const Request& request)
 
   // Parse the query string in the request body (since this is a POST)
   // in order to determine the framework ID to shutdown.
-  hashmap<string, string> values =
-    process::http::query::parse(request.body);
+  Try<hashmap<string, string>> decode =
+    process::http::query::decode(request.body);
+
+  if (decode.isError()) {
+    return BadRequest("Unable to decode query string: " + decode.error());
+  }
+
+  hashmap<string, string> values = decode.get();
 
   if (values.get("frameworkId").isNone()) {
     return BadRequest("Missing 'frameworkId' query parameter");

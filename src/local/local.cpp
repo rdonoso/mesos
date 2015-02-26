@@ -21,6 +21,8 @@
 #include <sstream>
 #include <vector>
 
+#include <mesos/module/anonymous.hpp>
+
 #include <process/owned.hpp>
 #include <process/pid.hpp>
 
@@ -40,21 +42,24 @@
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
-#include "master/allocator.hpp"
 #include "master/contender.hpp"
 #include "master/detector.hpp"
-#include "master/drf_sorter.hpp"
-#include "master/hierarchical_allocator_process.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
 #include "master/repairer.hpp"
 
+#include "master/allocator/allocator.hpp"
+#include "master/allocator/mesos/hierarchical.hpp"
+#include "master/allocator/sorter/drf/sorter.hpp"
+
 #include "module/manager.hpp"
 
-#include "slave/containerizer/containerizer.hpp"
 #include "slave/gc.hpp"
 #include "slave/slave.hpp"
 #include "slave/status_update_manager.hpp"
+
+#include "slave/containerizer/containerizer.hpp"
+#include "slave/containerizer/fetcher.hpp"
 
 #include "state/in_memory.hpp"
 #include "state/log.hpp"
@@ -65,18 +70,20 @@ using namespace mesos::internal;
 using namespace mesos::internal::log;
 
 using mesos::internal::master::allocator::Allocator;
-using mesos::internal::master::allocator::AllocatorProcess;
-using mesos::internal::master::allocator::DRFSorter;
-using mesos::internal::master::allocator::HierarchicalDRFAllocatorProcess;
+using mesos::internal::master::allocator::HierarchicalDRFAllocator;
 
 using mesos::internal::master::Master;
 using mesos::internal::master::Registrar;
 using mesos::internal::master::Repairer;
 
 using mesos::internal::slave::Containerizer;
+using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::GarbageCollector;
 using mesos::internal::slave::Slave;
 using mesos::internal::slave::StatusUpdateManager;
+
+using mesos::modules::Anonymous;
+using mesos::modules::ModuleManager;
 
 using process::Owned;
 using process::PID;
@@ -94,7 +101,6 @@ namespace internal {
 namespace local {
 
 static Allocator* allocator = NULL;
-static AllocatorProcess* allocatorProcess = NULL;
 static Log* log = NULL;
 static state::Storage* storage = NULL;
 static state::protobuf::State* state = NULL;
@@ -108,6 +114,7 @@ static Option<Authorizer*> authorizer = None();
 static Files* files = NULL;
 static vector<GarbageCollector*>* garbageCollectors = NULL;
 static vector<StatusUpdateManager*>* statusUpdateManagers = NULL;
+static vector<Fetcher*>* fetchers = NULL;
 
 
 PID<Master> launch(const Flags& flags, Allocator* _allocator)
@@ -118,13 +125,11 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
   if (_allocator == NULL) {
     // Create default allocator, save it for deleting later.
-    allocatorProcess = new HierarchicalDRFAllocatorProcess();
-    _allocator = allocator = new Allocator(allocatorProcess);
+    _allocator = allocator = new HierarchicalDRFAllocator();
   } else {
     // TODO(benh): Figure out the behavior of allocator pointer and remove the
     // else block.
     allocator = NULL;
-    allocatorProcess = NULL;
   }
 
   files = new Files();
@@ -140,7 +145,7 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     // Load modules. Note that this covers both, master and slave
     // specific modules as both use the same flag (--modules).
     if (flags.modules.isSome()) {
-      Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
+      Try<Nothing> result = ModuleManager::load(flags.modules.get());
       if (result.isError()) {
         EXIT(1) << "Error loading modules: " << result.error();
       }
@@ -195,6 +200,22 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
       authorizer = authorizer__.release();
     }
 
+    // Create anonymous modules.
+    foreach (const string& name, ModuleManager::find<Anonymous>()) {
+      Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
+      if (create.isError()) {
+        EXIT(1) << "Failed to create anonymous module named '" << name << "'";
+      }
+
+      // We don't bother keeping around the pointer to this anonymous
+      // module, when we exit that will effectively free it's memory.
+      //
+      // TODO(benh): We might want to add explicit finalization (and
+      // maybe explicit initialization too) in order to let the module
+      // do any housekeeping necessary when the master is cleanly
+      // terminating.
+    }
+
     master = new Master(
         _allocator,
         registrar,
@@ -212,6 +233,7 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
   garbageCollectors = new vector<GarbageCollector*>();
   statusUpdateManagers = new vector<StatusUpdateManager*>();
+  fetchers = new vector<Fetcher*>();
 
   vector<UPID> pids;
 
@@ -226,8 +248,11 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
     garbageCollectors->push_back(new GarbageCollector());
     statusUpdateManagers->push_back(new StatusUpdateManager(flags));
+    fetchers->push_back(new Fetcher());
 
-    Try<Containerizer*> containerizer = Containerizer::create(flags, true);
+    Try<Containerizer*> containerizer =
+      Containerizer::create(flags, true, fetchers->back());
+
     if (containerizer.isError()) {
       EXIT(1) << "Failed to create a containerizer: " << containerizer.error();
     }
@@ -261,7 +286,6 @@ void shutdown()
     process::wait(master->self());
     delete master;
     delete allocator;
-    delete allocatorProcess;
     master = NULL;
 
     // TODO(benh): Ugh! Because the isolator calls back into the slave
@@ -306,6 +330,13 @@ void shutdown()
 
     delete statusUpdateManagers;
     statusUpdateManagers = NULL;
+
+    foreach (Fetcher* fetcher, *fetchers) {
+      delete fetcher;
+    }
+
+    delete fetchers;
+    fetchers = NULL;
 
     delete registrar;
     registrar = NULL;

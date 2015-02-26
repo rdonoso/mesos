@@ -18,12 +18,13 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [0.22.0])
+AC_INIT([mesos], [0.23.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
 AC_CANONICAL_BUILD
 AC_CANONICAL_TARGET
+AC_DISABLE_STATIC
 
 AC_LANG([C++])
 
@@ -668,7 +669,14 @@ libapr-1 is required for mesos to build.
 # the CPPFLAGS and LDFLAGS with respective /include and /lib path
 # suffixes. We include /include/subversion-1 because we include
 # <svn_*> directly.
-if test -n "`echo $with_svn`" ; then
+if test -z "`echo $with_svn`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions subversion`"; then
+    with_svn=`brew --prefix subversion`
+fi
+
+if test -n "`echo $with_svn`"; then
     CPPFLAGS="-I${with_svn}/include/subversion-1 $CPPFLAGS"
     LDFLAGS="-L${with_svn}/lib $LDFLAGS"
 else

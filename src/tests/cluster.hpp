@@ -52,20 +52,23 @@
 
 #include "log/tool/initialize.hpp"
 
-#include "master/allocator.hpp"
 #include "master/contender.hpp"
 #include "master/detector.hpp"
-#include "master/hierarchical_allocator_process.hpp"
 #include "master/flags.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
 #include "master/repairer.hpp"
 
+#include "master/allocator/allocator.hpp"
+#include "master/allocator/mesos/hierarchical.hpp"
+
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
-#include "slave/containerizer/containerizer.hpp"
 #include "slave/slave.hpp"
 #include "slave/status_update_manager.hpp"
+
+#include "slave/containerizer/containerizer.hpp"
+#include "slave/containerizer/fetcher.hpp"
 
 #include "state/in_memory.hpp"
 #include "state/log.hpp"
@@ -97,7 +100,7 @@ public:
     // Start a new master with the provided flags and injections.
     Try<process::PID<master::Master> > start(
         const master::Flags& flags = master::Flags(),
-        const Option<master::allocator::AllocatorProcess*>& allocator = None(),
+        const Option<master::allocator::Allocator*>& allocator = None(),
         const Option<Authorizer*>& authorizer = None());
 
     // Stops and cleans up a master at the specified PID.
@@ -117,10 +120,10 @@ public:
     // Encapsulates a single master's dependencies.
     struct Master
     {
-      Master() : master(NULL) {}
+      Master() : allocator(NULL), createdAllocator(false), master(NULL) {}
 
-      process::Owned<master::allocator::AllocatorProcess> allocatorProcess;
-      process::Owned<master::allocator::Allocator> allocator;
+      master::allocator::Allocator* allocator;
+      bool createdAllocator; // Whether we own the allocator.
 
       process::Owned<log::Log> log;
       process::Owned<state::Storage> storage;
@@ -185,6 +188,7 @@ public:
       slave::Containerizer* containerizer;
       bool createdContainerizer; // Whether we own the containerizer.
 
+      process::Owned<slave::Fetcher> fetcher;
       process::Owned<slave::StatusUpdateManager> statusUpdateManager;
       process::Owned<slave::GarbageCollector> gc;
       process::Owned<MasterDetector> detector;
@@ -241,7 +245,7 @@ inline void Cluster::Masters::shutdown()
 
 inline Try<process::PID<master::Master> > Cluster::Masters::start(
     const master::Flags& flags,
-    const Option<master::allocator::AllocatorProcess*>& allocatorProcess,
+    const Option<master::allocator::Allocator*>& allocator,
     const Option<Authorizer*>& authorizer)
 {
   // Disallow multiple masters when not using ZooKeeper.
@@ -251,14 +255,13 @@ inline Try<process::PID<master::Master> > Cluster::Masters::start(
 
   Master master;
 
-  if (allocatorProcess.isNone()) {
-    master.allocatorProcess.reset(
-        new master::allocator::HierarchicalDRFAllocatorProcess());
-    master.allocator.reset(
-        new master::allocator::Allocator(master.allocatorProcess.get()));
+  if (allocator.isSome()) {
+    master.allocator = allocator.get();
   } else {
-    master.allocator.reset(
-        new master::allocator::Allocator(allocatorProcess.get()));
+    // If allocator is not provided, fall back to the default one,
+    // managed by Cluster::Masters.
+    master.allocator = new master::allocator::HierarchicalDRFAllocator();
+    master.createdAllocator = true;
   }
 
   if (flags.registry == "in_memory") {
@@ -331,7 +334,7 @@ inline Try<process::PID<master::Master> > Cluster::Masters::start(
   }
 
   master.master = new master::Master(
-      master.allocator.get(),
+      master.allocator,
       master.registrar.get(),
       master.repairer.get(),
       &cluster->files,
@@ -395,6 +398,10 @@ inline Try<Nothing> Cluster::Masters::stop(
   process::wait(master.master);
   delete master.master;
 
+  if (master.createdAllocator) {
+    delete master.allocator;
+  }
+
   masters.erase(pid);
 
   return Nothing();
@@ -432,21 +439,28 @@ inline void Cluster::Slaves::shutdown()
   foreachpair (const process::PID<slave::Slave>& pid,
                const Slave& slave,
                copy) {
-    process::Future<hashset<ContainerID> > containers =
+    // Destroy the existing containers on the slave. Note that some
+    // containers may terminate while we are doing this, so we ignore
+    // any 'wait' failures and ensure that there are no containers
+    // when we're done destroying.
+    process::Future<hashset<ContainerID>> containers =
       slave.containerizer->containers();
     AWAIT_READY(containers);
 
     foreach (const ContainerID& containerId, containers.get()) {
-      // We need to wait on the container before destroying it in case someone
-      // else has already waited on it (and therefore would be immediately
-      // 'reaped' before we could wait on it).
       process::Future<containerizer::Termination> wait =
         slave.containerizer->wait(containerId);
 
       slave.containerizer->destroy(containerId);
 
-      AWAIT_READY(wait);
+      AWAIT(wait);
     }
+
+    containers = slave.containerizer->containers();
+    AWAIT_READY(containers);
+
+    ASSERT_TRUE(containers.get().empty())
+      << "Failed to destroy containers: " << stringify(containers.get());
 
     stop(pid);
   }
@@ -468,8 +482,11 @@ inline Try<process::PID<slave::Slave> > Cluster::Slaves::start(
   if (containerizer.isSome()) {
     slave.containerizer = containerizer.get();
   } else {
+    // Create a new fetcher.
+    slave.fetcher.reset(new slave::Fetcher());
+
     Try<slave::Containerizer*> containerizer =
-      slave::Containerizer::create(flags, true);
+      slave::Containerizer::create(flags, true, slave.fetcher.get());
     CHECK_SOME(containerizer);
 
     slave.containerizer = containerizer.get();

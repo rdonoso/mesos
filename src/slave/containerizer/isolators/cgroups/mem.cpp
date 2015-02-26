@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <mesos/resources.hpp>
+#include <mesos/type_utils.hpp>
 #include <mesos/values.hpp>
 
 #include <process/collect.hpp>
@@ -38,8 +39,6 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
-#include "common/type_utils.hpp"
-
 #include "linux/cgroups.hpp"
 
 #include "slave/containerizer/isolators/cgroups/mem.hpp"
@@ -55,6 +54,11 @@ using std::vector;
 namespace mesos {
 namespace internal {
 namespace slave {
+
+using mesos::slave::ExecutorRunState;
+using mesos::slave::Isolator;
+using mesos::slave::IsolatorProcess;
+using mesos::slave::Limitation;
 
 
 template<class T>
@@ -132,20 +136,12 @@ Try<Isolator*> CgroupsMemIsolatorProcess::create(const Flags& flags)
 
 
 Future<Nothing> CgroupsMemIsolatorProcess::recover(
-    const list<state::RunState>& states)
+    const list<ExecutorRunState>& states)
 {
   hashset<string> cgroups;
 
-  foreach (const state::RunState& state, states) {
-    if (state.id.isNone()) {
-      foreachvalue (Info* info, infos) {
-        delete info;
-      }
-      infos.clear();
-      return Failure("ContainerID is required to recover");
-    }
-
-    const ContainerID& containerId = state.id.get();
+  foreach (const ExecutorRunState& state, states) {
+    const ContainerID& containerId = state.id;
     const string cgroup = path::join(flags.cgroups_root, containerId.value());
 
     Try<bool> exists = cgroups::exists(hierarchy, cgroup);
@@ -573,7 +569,10 @@ void CgroupsMemIsolatorProcess::oom(const ContainerID& containerId)
 
   LOG(INFO) << strings::trim(message.str()); // Trim the extra '\n' at the end.
 
-  Resource mem = Resources::parse(
+  // TODO(jieyu): This is not accurate if the memory resource is from
+  // a non-star role or spans roles (e.g., "*" and "role"). Ideally,
+  // we should save the resources passed in and report it here.
+  Resources mem = Resources::parse(
       "mem",
       stringify(usage.isSome() ? usage.get().megabytes() : 0),
       "*").get();

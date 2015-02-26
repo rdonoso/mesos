@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include <mesos/type_utils.hpp>
+
 #include <process/help.hpp>
 #include <process/owned.hpp>
 
@@ -37,7 +39,6 @@
 #include "common/attributes.hpp"
 #include "common/build.hpp"
 #include "common/http.hpp"
-#include "common/type_utils.hpp"
 
 #include "mesos/mesos.hpp"
 #include "mesos/resources.hpp"
@@ -361,14 +362,18 @@ Future<Response> Slave::Http::state(const Request& request)
   object.values["lost_tasks"] = slave->stats.tasks[TASK_LOST];
 
   if (slave->master.isSome()) {
-    Try<string> masterHostname = net::getHostname(slave->master.get().node.ip);
-    if (masterHostname.isSome()) {
-      object.values["master_hostname"] = masterHostname.get();
+    Try<string> hostname = net::getHostname(slave->master.get().address.ip);
+    if (hostname.isSome()) {
+      object.values["master_hostname"] = hostname.get();
     }
   }
 
   if (slave->flags.log_dir.isSome()) {
     object.values["log_dir"] = slave->flags.log_dir.get();
+  }
+
+  if (slave->flags.external_log_file.isSome()) {
+    object.values["external_log_file"] = slave->flags.external_log_file.get();
   }
 
   JSON::Array frameworks;

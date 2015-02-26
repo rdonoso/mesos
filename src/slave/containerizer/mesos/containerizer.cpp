@@ -16,15 +16,21 @@
  * limitations under the License.
  */
 
+#include <mesos/module/isolator.hpp>
+
+#include <mesos/slave/isolator.hpp>
+
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/io.hpp>
+#include <process/metrics/metrics.hpp>
 #include <process/reap.hpp>
 #include <process/subprocess.hpp>
 
+#include <stout/fs.hpp>
 #include <stout/os.hpp>
+#include <stout/path.hpp>
 
-#include "module/isolator.hpp"
 #include "module/manager.hpp"
 
 #include "slave/paths.hpp"
@@ -32,13 +38,13 @@
 
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
-#include "slave/containerizer/isolator.hpp"
 #include "slave/containerizer/launcher.hpp"
 #ifdef __linux__
 #include "slave/containerizer/linux_launcher.hpp"
 #endif // __linux__
 
 #include "slave/containerizer/isolators/posix.hpp"
+#include "slave/containerizer/isolators/posix/disk.hpp"
 #ifdef __linux__
 #include "slave/containerizer/isolators/cgroups/cpushare.hpp"
 #include "slave/containerizer/isolators/cgroups/mem.hpp"
@@ -66,6 +72,11 @@ namespace slave {
 
 using mesos::modules::ModuleManager;
 
+using mesos::slave::ExecutorRunState;
+using mesos::slave::Isolator;
+using mesos::slave::IsolatorProcess;
+using mesos::slave::Limitation;
+
 using state::SlaveState;
 using state::FrameworkState;
 using state::ExecutorState;
@@ -77,7 +88,8 @@ Future<Nothing> _nothing() { return Nothing(); }
 
 Try<MesosContainerizer*> MesosContainerizer::create(
     const Flags& flags,
-    bool local)
+    bool local,
+    Fetcher* fetcher)
 {
   string isolation;
   if (flags.isolation == "process") {
@@ -105,6 +117,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 
   creators["posix/cpu"]   = &PosixCpuIsolatorProcess::create;
   creators["posix/mem"]   = &PosixMemIsolatorProcess::create;
+  creators["posix/disk"]  = &PosixDiskIsolatorProcess::create;
 #ifdef __linux__
   creators["cgroups/cpu"] = &CgroupsCpushareIsolatorProcess::create;
   creators["cgroups/mem"] = &CgroupsMemIsolatorProcess::create;
@@ -164,16 +177,22 @@ Try<MesosContainerizer*> MesosContainerizer::create(
   }
 
   return new MesosContainerizer(
-      flags_, local, Owned<Launcher>(launcher.get()), isolators);
+      flags_, local, fetcher, Owned<Launcher>(launcher.get()), isolators);
 }
 
 
 MesosContainerizer::MesosContainerizer(
     const Flags& flags,
     bool local,
+    Fetcher* fetcher,
     const Owned<Launcher>& launcher,
     const vector<Owned<Isolator>>& isolators)
-  : process(new MesosContainerizerProcess(flags, local, launcher, isolators))
+  : process(new MesosContainerizerProcess(
+      flags,
+      local,
+      fetcher,
+      launcher,
+      isolators))
 {
   spawn(process.get());
 }
@@ -291,7 +310,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
   LOG(INFO) << "Recovering containerizer";
 
   // Gather the executor run states that we will attempt to recover.
-  list<RunState> recoverable;
+  list<ExecutorRunState> recoverable;
   if (state.isSome()) {
     foreachvalue (const FrameworkState& framework, state.get().frameworks) {
       foreachvalue (const ExecutorState& executor, framework.executors) {
@@ -313,6 +332,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
         const ContainerID& containerId = executor.latest.get();
         Option<RunState> run = executor.runs.get(containerId);
         CHECK_SOME(run);
+        CHECK_SOME(run.get().id);
 
         // We need the pid so the reaper can monitor the executor so skip this
         // executor if it's not present. This is not an error because the slave
@@ -334,7 +354,12 @@ Future<Nothing> MesosContainerizerProcess::recover(
                   << "' for executor '" << executor.id
                   << "' of framework " << framework.id;
 
-        recoverable.push_back(run.get());
+        ExecutorRunState executorRunState(
+            run.get().id.get(),
+            run.get().forkedPid.get(),
+            run.get().directory);
+
+        recoverable.push_back(executorRunState);
       }
     }
   }
@@ -346,7 +371,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
 
 
 Future<Nothing> MesosContainerizerProcess::_recover(
-    const list<RunState>& recoverable)
+    const list<ExecutorRunState>& recoverable)
 {
   // Then recover the isolators.
   list<Future<Nothing>> futures;
@@ -361,18 +386,19 @@ Future<Nothing> MesosContainerizerProcess::_recover(
 
 
 Future<Nothing> MesosContainerizerProcess::__recover(
-    const list<RunState>& recovered)
+    const list<ExecutorRunState>& recovered)
 {
-  foreach (const RunState& run, recovered) {
-    CHECK_SOME(run.id);
-    CHECK_SOME(run.forkedPid);
-
-    const ContainerID& containerId = run.id.get();
+  foreach (const ExecutorRunState& run, recovered) {
+    const ContainerID& containerId = run.id;
 
     Container* container = new Container();
-    Future<Option<int>> status = process::reap(run.forkedPid.get());
+
+    Future<Option<int>> status = process::reap(run.pid);
     status.onAny(defer(self(), &Self::reaped, containerId));
     container->status = status;
+
+    container->directory = run.directory;
+
     // We only checkpoint the containerizer pid after the container
     // successfully launched, therefore we can assume checkpointed
     // containers should be running after recover.
@@ -428,14 +454,30 @@ Future<bool> MesosContainerizerProcess::launch(
     return false;
   }
 
-  Container* container = new Container();
-  container->resources = executorInfo.resources();
-  container->state = PREPARING;
-  containers_[containerId] = Owned<Container>(container);
-
   LOG(INFO) << "Starting container '" << containerId
             << "' for executor '" << executorInfo.executor_id()
             << "' of framework '" << executorInfo.framework_id() << "'";
+
+  Container* container = new Container();
+  container->directory = directory;
+  container->state = PREPARING;
+  containers_[containerId] = Owned<Container>(container);
+
+  // Prepare volumes for the container.
+  // TODO(jieyu): Consider decoupling file system isolation from
+  // runtime isolation. The existing isolators are actually for
+  // runtime isolation. For file system isolation, the interface might
+  // be different and we always need a file system isolator. The
+  // following logic should be moved to the file system isolator.
+  Try<Nothing> update = updateVolumes(containerId, executorInfo.resources());
+  if (update.isError()) {
+    return Failure("Failed to prepare volumes: " + update.error());
+  }
+
+  // NOTE: We do not update 'container->resources' until volumes are
+  // prepared because 'updateVolumes' above depends on the current
+  // container resources.
+  container->resources = executorInfo.resources();
 
   return prepare(containerId, executorInfo, directory, user)
     .then(defer(self(),
@@ -449,8 +491,24 @@ Future<bool> MesosContainerizerProcess::launch(
                 checkpoint,
                 lambda::_1))
     .onFailed(defer(self(),
-                    &Self::destroy,
-                    containerId));
+                    &Self::__launch,
+                    containerId,
+                    executorInfo,
+                    lambda::_1));
+}
+
+
+void MesosContainerizerProcess::__launch(
+    const ContainerID& containerId,
+    const ExecutorInfo& executorInfo,
+    const string& failure)
+{
+  LOG(ERROR) << "Failed to launch container '" << containerId
+             << "' for executor '" << executorInfo.executor_id()
+             << "' of framework '" << executorInfo.framework_id()
+             << "': " << failure;
+
+  destroy(containerId);
 }
 
 
@@ -540,29 +598,12 @@ Future<Nothing> MesosContainerizerProcess::fetch(
     return Failure("Container is already destroyed");
   }
 
-  if (commandInfo.uris().size() == 0) {
-    return Nothing();
-  }
-
-  Try<Subprocess> fetcher = fetcher::run(
+  return fetcher->fetch(
+      containerId,
       commandInfo,
       directory,
       user,
       flags);
-
-  if (fetcher.isError()) {
-    return Failure("Failed to execute mesos-fetcher: " + fetcher.error());
-  }
-
-  // TODO(tnachen): Currently the fetcher won't shutdown when slave
-  // exits. This means the fetcher will still be running when slave
-  // restarts and after recovering. We won't resume the task since
-  // it hasn't checkpointed yet. Once the fetcher supports existing
-  // on slave it will be removed automatically.
-  containers_[containerId]->fetcher = fetcher.get();
-
-  return fetcher.get().status()
-    .then(lambda::bind(&fetcher::_run, containerId, lambda::_1));
 }
 
 
@@ -773,7 +814,7 @@ Future<containerizer::Termination> MesosContainerizerProcess::wait(
 
 Future<Nothing> MesosContainerizerProcess::update(
     const ContainerID& containerId,
-    const Resources& _resources)
+    const Resources& resources)
 {
   if (!containers_.contains(containerId)) {
     // It is not considered a failure if the container is not known
@@ -784,19 +825,29 @@ Future<Nothing> MesosContainerizerProcess::update(
     return Nothing();
   }
 
-  if (containers_[containerId]->state == DESTROYING) {
+  const Owned<Container>& container = containers_[containerId];
+
+  if (container->state == DESTROYING) {
     LOG(WARNING) << "Ignoring update for currently being destroyed container: "
                  << containerId;
     return Nothing();
   }
 
-  // Store the resources for usage().
-  containers_[containerId]->resources = _resources;
+  // Update volumes for the container.
+  // TODO(jieyu): See comments above 'updateVolumes' in 'launch'.
+  Try<Nothing> update = updateVolumes(containerId, resources);
+  if (update.isError()) {
+    return Failure("Failed to update volumes: " + update.error());
+  }
+
+  // NOTE: We update container's resources before isolators are updated
+  // so that subsequent containerizer->update can be handled properly.
+  container->resources = resources;
 
   // Update each isolator.
   list<Future<Nothing>> futures;
   foreach (const Owned<Isolator>& isolator, isolators) {
-    futures.push_back(isolator->update(containerId, _resources));
+    futures.push_back(isolator->update(containerId, resources));
   }
 
   // Wait for all isolators to complete.
@@ -899,10 +950,8 @@ void MesosContainerizerProcess::destroy(const ContainerID& containerId)
     return;
   }
 
-  if (container->state == FETCHING && container->fetcher.isSome()) {
-    VLOG(1) << "Killing the fetcher for container '" << containerId << "'";
-    // Best effort kill the entire fetcher tree.
-    os::killtree(container->fetcher.get().pid(), SIGKILL);
+  if (container->state == FETCHING) {
+    fetcher->kill(containerId);
   }
 
   if (container->state == ISOLATING) {
@@ -950,6 +999,8 @@ void MesosContainerizerProcess::__destroy(
         (future.isFailed() ? future.failure() : "discarded future"));
 
     containers_.erase(containerId);
+
+    ++metrics.container_destroy_errors;
 
     return;
   }
@@ -1051,6 +1102,8 @@ void MesosContainerizerProcess::____destroy(
 
       containers_.erase(containerId);
 
+      ++metrics.container_destroy_errors;
+
       return;
     }
   }
@@ -1109,8 +1162,9 @@ void MesosContainerizerProcess::limited(
 
   if (future.isReady()) {
     LOG(INFO) << "Container " << containerId << " has reached its limit for"
-              << " resource " << future.get().resource
+              << " resource " << future.get().resources
               << " and will be terminated";
+
     containers_[containerId]->limitations.push_back(future.get());
   } else {
     // TODO(idownes): A discarded future will not be an error when
@@ -1130,6 +1184,116 @@ Future<hashset<ContainerID>> MesosContainerizerProcess::containers()
   return containers_.keys();
 }
 
+
+MesosContainerizerProcess::Metrics::Metrics()
+  : container_destroy_errors(
+        "containerizer/mesos/container_destroy_errors")
+{
+  process::metrics::add(container_destroy_errors);
+}
+
+
+MesosContainerizerProcess::Metrics::~Metrics()
+{
+  process::metrics::remove(container_destroy_errors);
+}
+
+
+Try<Nothing> MesosContainerizerProcess::updateVolumes(
+    const ContainerID& containerId,
+    const Resources& updated)
+{
+  CHECK(containers_.contains(containerId));
+  const Owned<Container>& container = containers_[containerId];
+
+  // TODO(jieyu): Currently, we only allow non-nested relative
+  // container paths for volumes. This is enforced by the master. For
+  // those volumes, we create symlinks in the executor directory. No
+  // need to proceed if the container change the file system root
+  // because the symlinks will become invalid if the file system root
+  // is changed. Consider moving this logic to the file system
+  // isolator and let the file system isolator decide how to mount
+  // those volumes (by either creating symlinks or doing bind mounts).
+  if (container->rootfs.isSome()) {
+    LOG(WARNING) << "Cannot update volumes for container " << containerId
+                 << " because it changes the file system root";
+    return Nothing();
+  }
+
+  Resources current = container->resources;
+
+  // We first remove unneeded persistent volumes.
+  foreach (const Resource& resource, current.persistentVolumes()) {
+    // This is enforced by the master.
+    CHECK(resource.disk().has_volume());
+
+    // Ignore absolute and nested paths.
+    const string& containerPath = resource.disk().volume().container_path();
+    if (strings::contains(containerPath, "/")) {
+      LOG(WARNING) << "Skipping updating symlink for persistent volume "
+                   << resource << " of container " << containerId
+                   << " because the container path '" << containerPath
+                   << "' contains slash";
+      continue;
+    }
+
+    if (updated.contains(resource)) {
+      continue;
+    }
+
+    string link = path::join(container->directory, containerPath);
+
+    LOG(INFO) << "Removing symlink '" << link << "' for persistent volume "
+              << resource << " of container " << containerId;
+
+    Try<Nothing> rm = os::rm(link);
+    if (rm.isError()) {
+      return Error(
+          "Failed to remove the symlink for the unneeded "
+          "persistent volume at '" + link + "'");
+    }
+  }
+
+  // We then link additional persistent volumes.
+  foreach (const Resource& resource, updated.persistentVolumes()) {
+    // This is enforced by the master.
+    CHECK(resource.disk().has_volume());
+
+    // Ignore absolute and nested paths.
+    const string& containerPath = resource.disk().volume().container_path();
+    if (strings::contains(containerPath, "/")) {
+      LOG(WARNING) << "Skipping updating symlink for persistent volume "
+                   << resource << " of container " << containerId
+                   << " because the container path '" << containerPath
+                   << "' contains slash";
+      continue;
+    }
+
+    if (current.contains(resource)) {
+      continue;
+    }
+
+    string link = path::join(container->directory, containerPath);
+
+    string original = paths::getPersistentVolumePath(
+        flags.work_dir,
+        resource.role(),
+        resource.disk().persistence().id());
+
+    LOG(INFO) << "Adding symlink from '" << original << "' to '"
+              << link << "' for persistent volume " << resource
+              << " of container " << containerId;
+
+    Try<Nothing> symlink = fs::symlink(original, link);
+    if (symlink.isError()) {
+      return Error(
+          "Failed to symlink persistent volume from '" +
+          original + "' to '" + link + "'");
+    }
+  }
+
+  return Nothing();
+}
 
 } // namespace slave {
 } // namespace internal {

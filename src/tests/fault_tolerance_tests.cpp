@@ -24,6 +24,8 @@
 #include <mesos/mesos.hpp>
 #include <mesos/scheduler.hpp>
 
+#include <mesos/authentication/authentication.hpp>
+
 #include <process/future.hpp>
 #include <process/gmock.hpp>
 #include <process/http.hpp>
@@ -37,8 +39,9 @@
 
 #include "common/protobuf_utils.hpp"
 
-#include "master/allocator.hpp"
 #include "master/master.hpp"
+
+#include "master/allocator/allocator.hpp"
 
 #include "sched/constants.hpp"
 
@@ -48,10 +51,7 @@
 #include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 
-using namespace mesos;
-using namespace mesos::internal;
 using namespace mesos::internal::protobuf;
-using namespace mesos::internal::tests;
 
 using mesos::internal::master::Master;
 
@@ -77,6 +77,10 @@ using testing::Eq;
 using testing::Not;
 using testing::Return;
 using testing::SaveArg;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 class FaultToleranceTest : public MesosTest {};
@@ -612,8 +616,8 @@ TEST_F(FaultToleranceTest, SchedulerReregisterAfterFailoverTimeout)
   AWAIT_READY(frameworkRegisteredMessage);
   AWAIT_READY(frameworkId);
 
-  Future<Nothing> frameworkDeactivated = FUTURE_DISPATCH(
-      _, &master::allocator::AllocatorProcess::frameworkDeactivated);
+  Future<Nothing> deactivateFramework = FUTURE_DISPATCH(
+      _, &master::allocator::MesosAllocatorProcess::deactivateFramework);
 
   Future<Nothing> frameworkFailoverTimeout =
     FUTURE_DISPATCH(_, &Master::frameworkFailoverTimeout);
@@ -623,7 +627,7 @@ TEST_F(FaultToleranceTest, SchedulerReregisterAfterFailoverTimeout)
       frameworkRegisteredMessage.get().to, master.get()));
 
   // Wait until master schedules the framework for removal.
-  AWAIT_READY(frameworkDeactivated);
+  AWAIT_READY(deactivateFramework);
 
   // Simulate framework failover timeout.
   Clock::pause();
@@ -698,15 +702,15 @@ TEST_F(FaultToleranceTest, SchedulerReregisterAfterUnregistration)
   AWAIT_READY(frameworkRegisteredMessage);
   AWAIT_READY(frameworkId);
 
-  Future<Nothing> frameworkRemoved = FUTURE_DISPATCH(
-      _, &master::allocator::AllocatorProcess::frameworkRemoved);
+  Future<Nothing> removeFramework = FUTURE_DISPATCH(
+      _, &master::allocator::MesosAllocatorProcess::removeFramework);
 
   // Unregister the framework.
   driver1.stop();
   driver1.join();
 
   // Wait until master actually marks the framework as completed.
-  AWAIT_READY(frameworkRemoved);
+  AWAIT_READY(removeFramework);
 
   // Now launch the second (i.e., failover) scheduler using the
   // framework id recorded from the first scheduler.
@@ -1206,18 +1210,19 @@ TEST_F(FaultToleranceTest, ReregisterFrameworkExitedExecutor)
 
   AWAIT_READY(executorExitedMessage);
 
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
   // Now notify the framework of the new master.
-  Future<FrameworkRegisteredMessage> frameworkRegisteredMessage2 =
-    FUTURE_PROTOBUF(FrameworkRegisteredMessage(), _, _);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
   schedDetector.appoint(master.get());
 
-  AWAIT_READY(frameworkRegisteredMessage2);
+  // Ensure framework successfully registers.
+  AWAIT_READY(registered);
 
   driver.stop();
   driver.join();
+
   Shutdown();
 }
 
@@ -1379,12 +1384,16 @@ TEST_F(FaultToleranceTest, SchedulerFailoverFrameworkMessage)
   EXPECT_CALL(sched2, frameworkMessage(&driver2, _, _, _))
     .WillOnce(FutureSatisfy(&frameworkMessage));
 
-  EXPECT_CALL(sched1, error(&driver1, "Framework failed over"));
+  Future<Nothing> error;
+  EXPECT_CALL(sched1, error(&driver1, "Framework failed over"))
+    .WillOnce(FutureSatisfy(&error));
 
   Future<UpdateFrameworkMessage> updateFrameworkMessage =
     FUTURE_PROTOBUF(UpdateFrameworkMessage(), _, _);
 
   driver2.start();
+
+  AWAIT_READY(error);
 
   AWAIT_READY(registered);
 
@@ -1875,3 +1884,7 @@ TEST_F(FaultToleranceTest, SplitBrainMasters)
 
   Shutdown();
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

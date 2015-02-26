@@ -21,6 +21,8 @@
 
 #include <string>
 
+#include <mesos/module/module.hpp>
+
 #include <stout/try.hpp>
 
 #include "logging/flags.hpp"
@@ -42,7 +44,9 @@ enum ModuleID
   TestMemIsolator,
   TestCpuIsolator,
   TestCRAMMD5Authenticatee,
-  TestCRAMMD5Authenticator
+  TestCRAMMD5Authenticator,
+  TestHook,
+  TestAnonymous
 };
 
 

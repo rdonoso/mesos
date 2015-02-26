@@ -26,18 +26,13 @@
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
 
-#include "master/hierarchical_allocator_process.hpp"
 #include "master/master.hpp"
+
+#include "master/allocator/mesos/hierarchical.hpp"
 
 #include "slave/slave.hpp"
 
 #include "tests/mesos.hpp"
-
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
-
-using mesos::internal::master::allocator::HierarchicalDRFAllocatorProcess;
 
 using mesos::internal::master::Master;
 
@@ -52,7 +47,16 @@ using testing::_;
 using testing::AtMost;
 using testing::Return;
 
+namespace mesos {
+namespace internal {
+namespace tests {
 
+
+// TODO(jieyu): All of the task validation tests have the same flow:
+// launch a task, expect an update of a particular format (invalid w/
+// message). Consider providing common functionalities in the test
+// fixture to avoid code bloat. Ultimately, we should make task or
+// offer validation unit testable.
 class TaskValidationTest : public MesosTest {};
 
 
@@ -200,65 +204,6 @@ TEST_F(TaskValidationTest, TaskUsesNoResources)
 }
 
 
-TEST_F(TaskValidationTest, TaskUsesEmptyResources)
-{
-  Try<PID<Master>> master = StartMaster();
-  ASSERT_SOME(master);
-
-  Try<PID<Slave>> slave = StartSlave();
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
-
-  TaskInfo task;
-  task.set_name("");
-  task.mutable_task_id()->set_value("1");
-  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
-
-  Resource* cpus = task.add_resources();
-  cpus->set_name("cpus");
-  cpus->set_type(Value::SCALAR);
-  cpus->mutable_scalar()->set_value(0);
-
-  vector<TaskInfo> tasks;
-  tasks.push_back(task);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  driver.launchTasks(offers.get()[0].id(), tasks);
-
-  AWAIT_READY(status);
-  EXPECT_EQ(task.task_id(), status.get().task_id());
-  EXPECT_EQ(TASK_ERROR, status.get().state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status.get().reason());
-  EXPECT_TRUE(status.get().has_message());
-  EXPECT_EQ("Task uses empty resources: cpus(*):0", status.get().message());
-
-  driver.stop();
-  driver.join();
-
-  Shutdown();
-}
-
-
 TEST_F(TaskValidationTest, TaskUsesMoreResourcesThanOffered)
 {
   Try<PID<Master>> master = StartMaster();
@@ -310,7 +255,6 @@ TEST_F(TaskValidationTest, TaskUsesMoreResourcesThanOffered)
   EXPECT_EQ(TASK_ERROR, status.get().state());
   EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status.get().reason());
   EXPECT_TRUE(status.get().has_message());
-
   EXPECT_TRUE(strings::contains(
       status.get().message(), "Task uses more resources"));
 
@@ -608,6 +552,97 @@ TEST_F(TaskValidationTest, ExecutorInfoDiffersOnDifferentSlaves)
 }
 
 
+// This test ensures that a persistent volume that is larger than the
+// offered disk resources results in a failed task.
+TEST_F(TaskValidationTest, DISABLED_AcquirePersistentDiskTooBig)
+{
+  // Create a framework with role "role1";
+  FrameworkInfo frameworkInfo;
+  frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role("role1");
+
+  // Setup ACLs in order to receive offers for "role1".
+  ACLs acls;
+  mesos::ACL::RegisterFramework* acl = acls.add_register_frameworks();
+  acl->mutable_principals()->add_values(frameworkInfo.principal());
+  acl->mutable_roles()->add_values(frameworkInfo.role());
+
+  // Start master with ACLs.
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.roles = frameworkInfo.role();
+  masterFlags.acls = acls;
+
+  Try<PID<Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.resources = "cpus(*):4;mem(*):2048;disk(role1):1024";
+
+  Try<PID<Slave>> slave = StartSlave(slaveFlags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  // Create a persistent volume whose size is larger than the size of
+  // the offered disk.
+  Resource diskResource = Resources::parse("disk", "2048", "role1").get();
+  diskResource.mutable_disk()->CopyFrom(createDiskInfo("1", "1"));
+
+  // Include other resources in task resources.
+  Resources taskResources =
+    Resources::parse("cpus:1;mem:128").get() + diskResource;
+
+  Offer offer = offers.get()[0];
+  TaskInfo task =
+    createTask(offer.slave_id(), taskResources, "", DEFAULT_EXECUTOR_ID);
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), tasks);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(task.task_id(), status.get().task_id());
+  EXPECT_EQ(TASK_ERROR, status.get().state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status.get().reason());
+  EXPECT_TRUE(status.get().has_message());
+  EXPECT_TRUE(strings::contains(
+      status.get().message(), "Failed to create persistent volumes"));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+// TODO(jieyu): Add tests for checking duplicated persistence ID
+// against offered resources.
+
+// TODO(jieyu): Add tests for checking duplicated persistence ID
+// across task and executors.
+
+// TODO(jieyu): Add tests for checking duplicated persistence ID
+// within an executor.
+
 // TODO(benh): Add tests for checking correct slave IDs.
 
 // TODO(benh): Add tests for checking executor resource usage.
@@ -797,7 +832,7 @@ TEST_F(ResourceOffersTest, ResourcesGetReofferedAfterTaskInfoError)
   Resource* cpus = task.add_resources();
   cpus->set_name("cpus");
   cpus->set_type(Value::SCALAR);
-  cpus->mutable_scalar()->set_value(0);
+  cpus->mutable_scalar()->set_value(-1);
 
   Resource* mem = task.add_resources();
   mem->set_name("mem");
@@ -818,7 +853,8 @@ TEST_F(ResourceOffersTest, ResourcesGetReofferedAfterTaskInfoError)
   EXPECT_EQ(TASK_ERROR, status.get().state());
   EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status.get().reason());
   EXPECT_TRUE(status.get().has_message());
-  EXPECT_EQ("Task uses empty resources: cpus(*):0", status.get().message());
+  EXPECT_TRUE(strings::startsWith(
+        status.get().message(), "Task uses invalid resources"));
 
   MockScheduler sched2;
   MesosSchedulerDriver driver2(
@@ -847,7 +883,7 @@ TEST_F(ResourceOffersTest, ResourcesGetReofferedAfterTaskInfoError)
 
 TEST_F(ResourceOffersTest, Request)
 {
-  MockAllocatorProcess<HierarchicalDRFAllocatorProcess> allocator;
+  TestAllocator<master::allocator::HierarchicalDRFAllocator> allocator;
 
   EXPECT_CALL(allocator, initialize(_, _, _))
     .Times(1);
@@ -859,7 +895,7 @@ TEST_F(ResourceOffersTest, Request)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(allocator, frameworkAdded(_, _, _))
+  EXPECT_CALL(allocator, addFramework(_, _, _))
     .Times(1);
 
   Future<Nothing> registered;
@@ -876,7 +912,7 @@ TEST_F(ResourceOffersTest, Request)
   sent.push_back(request);
 
   Future<vector<Request>> received;
-  EXPECT_CALL(allocator, resourcesRequested(_, _))
+  EXPECT_CALL(allocator, requestResources(_, _))
     .WillOnce(FutureArg<1>(&received));
 
   driver.requestResources(sent);
@@ -886,14 +922,12 @@ TEST_F(ResourceOffersTest, Request)
   EXPECT_NE(0u, received.get().size());
   EXPECT_EQ(request.slave_id(), received.get()[0].slave_id());
 
-  EXPECT_CALL(allocator, frameworkDeactivated(_))
-    .Times(AtMost(1)); // Races with shutting down the cluster.
-
-  EXPECT_CALL(allocator, frameworkRemoved(_))
-    .Times(AtMost(1)); // Races with shutting down the cluster.
-
   driver.stop();
   driver.join();
 
   Shutdown();
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

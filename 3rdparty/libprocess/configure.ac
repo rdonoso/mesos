@@ -71,6 +71,11 @@ AC_ARG_ENABLE([bundled],
                              of bundled libraries]),
               [enable_bundled=no], [enable_bundled=yes])
 
+AC_ARG_ENABLE([libevent],
+              AS_HELP_STRING([--enable-libevent],
+                             [use libevent instead of libev default: no]),
+              [enable_libevent=yes], [])
+
 AC_ARG_WITH([boost],
             AS_HELP_STRING([--with-boost@<:@=DIR@:>@],
                            [excludes building and using the bundled Boost
@@ -220,7 +225,14 @@ libapr-1 is required for mesos to build.
 # the CPPFLAGS and LDFLAGS with respective /include and /lib path
 # suffixes. We include /include/subversion-1 because we include
 # <svn_*> directly.
-if test -n "`echo $with_svn`" ; then
+if test -z "`echo $with_svn`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions subversion`"; then
+    with_svn=`brew --prefix subversion`
+fi
+
+if test -n "`echo $with_svn`"; then
     CPPFLAGS="-I${with_svn}/include/subversion-1 $CPPFLAGS"
     LDFLAGS="-L${with_svn}/lib $LDFLAGS"
 else
@@ -558,6 +570,42 @@ else
   optimize_flags="-O0"
 fi
 
+AM_CONDITIONAL([ENABLE_LIBEVENT], [test x"$enable_libevent" = "xyes"])
+
+if test "x$enable_libevent" = "xyes"; then
+  AC_CHECK_HEADERS([event2/event.h],
+                   [AC_CHECK_LIB([event],
+                                 [event_base_new],
+                                 [found_libevent=yes],
+                                 [AC_MSG_ERROR([cannot find libevent
+-------------------------------------------------------------------
+libevent is required for mesos to build.
+-------------------------------------------------------------------
+                          ])])], [AC_MSG_ERROR([cannot find libevent headers
+-------------------------------------------------------------------
+libevent is required for mesos to build.
+-------------------------------------------------------------------
+  ])])
+  if test "x$found_libevent" = "xyes"; then
+    AC_DEFINE([USE_LIBEVENT], [1])
+  fi
+  AC_CHECK_HEADERS([event2/thread.h],
+                   [AC_CHECK_LIB([event_pthreads],
+                                 [evthread_use_pthreads],
+                                 [found_libevent_thread=yes],
+                                 [AC_MSG_ERROR([cannot find libevent_pthreads
+-------------------------------------------------------------------
+libevent_pthreads is required for mesos to build.
+-------------------------------------------------------------------
+                          ])],
+                                 [-levent])],
+                                 [AC_MSG_ERROR([cannot find libevent_pthreads headers
+-------------------------------------------------------------------
+libevent_pthreads is required for mesos to build.
+-------------------------------------------------------------------
+  ])])
+fi
+
 AS_IF([test "x${ac_cv_env_CFLAGS_set}" = "x"],
       [CFLAGS="$debug_flags $optimize_flags"])
 AS_IF([test "x${ac_cv_env_CXXFLAGS_set}" = "x"],
@@ -655,7 +703,7 @@ esac
 # Also pass the flags to 3rdparty libraries.
 CONFIGURE_ARGS="$CONFIGURE_ARGS CXXFLAGS='$CXXFLAGS'"
 
-AC_CHECK_LIB([dl], [dlopen], [AC_MSG_RESULT([found])],
+AC_CHECK_LIB([dl], [dlopen], [],
 	     [AC_MSG_ERROR([cannot find libdl
 -------------------------------------------------------------------
 libdl was not found, and is required for compilation.

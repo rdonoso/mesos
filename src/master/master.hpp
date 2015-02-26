@@ -27,7 +27,12 @@
 
 #include <boost/circular_buffer.hpp>
 
+#include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
+#include <mesos/scheduler.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <mesos/module/authenticator.hpp>
 
 #include <process/http.hpp>
 #include <process/owned.hpp>
@@ -44,7 +49,7 @@
 #include <stout/option.hpp>
 
 #include "common/protobuf_utils.hpp"
-#include "common/type_utils.hpp"
+#include "common/resources_utils.hpp"
 
 #include "files/files.hpp"
 
@@ -54,6 +59,7 @@
 #include "master/flags.hpp"
 #include "master/metrics.hpp"
 #include "master/registrar.hpp"
+#include "master/validation.hpp"
 
 #include "messages/messages.hpp"
 
@@ -69,7 +75,6 @@ namespace registry {
 class Slaves;
 }
 
-class Authenticator;
 class Authorizer;
 class WhitelistWatcher;
 
@@ -83,11 +88,11 @@ class Allocator;
 class Repairer;
 class SlaveObserver;
 
+struct BoundedRateLimiter;
 struct Framework;
-struct OfferVisitor;
 struct Role;
 struct Slave;
-struct TaskInfoVisitor;
+
 
 class Master : public ProtobufProcess<Master>
 {
@@ -103,34 +108,43 @@ public:
 
   virtual ~Master();
 
+  // Message handlers.
   void submitScheduler(
       const std::string& name);
+
   void registerFramework(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo);
+
   void reregisterFramework(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       bool failover);
+
   void unregisterFramework(
       const process::UPID& from,
       const FrameworkID& frameworkId);
+
   void deactivateFramework(
       const process::UPID& from,
       const FrameworkID& frameworkId);
+
   void resourceRequest(
       const process::UPID& from,
       const FrameworkID& frameworkId,
       const std::vector<Request>& requests);
+
   void launchTasks(
       const process::UPID& from,
       const FrameworkID& frameworkId,
       const std::vector<TaskInfo>& tasks,
       const Filters& filters,
       const std::vector<OfferID>& offerIds);
+
   void reviveOffers(
       const process::UPID& from,
       const FrameworkID& frameworkId);
+
   void killTask(
       const process::UPID& from,
       const FrameworkID& frameworkId,
@@ -149,13 +163,17 @@ public:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const std::string& data);
+
   void registerSlave(
       const process::UPID& from,
       const SlaveInfo& slaveInfo,
+      const std::vector<Resource>& checkpointedResources,
       const std::string& version);
+
   void reregisterSlave(
       const process::UPID& from,
       const SlaveInfo& slaveInfo,
+      const std::vector<Resource>& checkpointedResources,
       const std::vector<ExecutorInfo>& executorInfos,
       const std::vector<Task>& tasks,
       const std::vector<Archive::Framework>& completedFrameworks,
@@ -169,6 +187,11 @@ public:
       const StatusUpdate& update,
       const process::UPID& pid);
 
+  void reconcileTasks(
+      const process::UPID& from,
+      const FrameworkID& frameworkId,
+      const std::vector<TaskStatus>& statuses);
+
   void exitedExecutor(
       const process::UPID& from,
       const SlaveID& slaveId,
@@ -180,6 +203,10 @@ public:
       const SlaveID& slaveId,
       const std::string& message);
 
+  void authenticate(
+      const process::UPID& from,
+      const process::UPID& pid);
+
   // TODO(bmahler): It would be preferred to use a unique libprocess
   // Process identifier (PID is not sufficient) for identifying the
   // framework instance, rather than relying on re-registration time.
@@ -190,15 +217,6 @@ public:
   void offer(
       const FrameworkID& framework,
       const hashmap<SlaveID, Resources>& resources);
-
-  void reconcileTasks(
-      const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const std::vector<TaskStatus>& statuses);
-
-  void authenticate(
-      const process::UPID& from,
-      const process::UPID& pid);
 
   // Invoked when there is a newly elected leading master.
   // Made public for testing purposes.
@@ -220,6 +238,7 @@ public:
   void _reregisterSlave(
       const SlaveInfo& slaveInfo,
       const process::UPID& pid,
+      const std::vector<Resource>& checkpointedResources,
       const std::vector<ExecutorInfo>& executorInfos,
       const std::vector<Task>& tasks,
       const std::vector<Archive::Framework>& completedFrameworks,
@@ -264,6 +283,7 @@ protected:
   void _registerSlave(
       const SlaveInfo& slaveInfo,
       const process::UPID& pid,
+      const std::vector<Resource>& checkpointedResources,
       const std::string& version,
       const process::Future<bool>& admit);
 
@@ -346,16 +366,6 @@ protected:
       const std::vector<StatusUpdate>& updates,
       const process::Future<bool>& removed);
 
-  // Validates the task.
-  // Returns None if the task is valid.
-  // Returns Error if the task is invalid.
-  Option<Error> validateTask(
-      const TaskInfo& task,
-      Framework* framework,
-      Slave* slave,
-      const Resources& totalResources,
-      const Resources& usedResources);
-
   // Authorizes the task.
   // Returns true if task is authorized.
   // Returns false if task is not authorized.
@@ -364,20 +374,11 @@ protected:
       const TaskInfo& task,
       Framework* framework);
 
-  // Launch a task from a task description.
-  Resources launchTask(
-      const TaskInfo& task,
-      Framework* framework,
-      Slave* slave);
-
-  // 'launchTasks()' continuation.
-  void _launchTasks(
-      const FrameworkID& frameworkId,
-      const SlaveID& slaveId,
-      const std::vector<TaskInfo>& tasks,
-      const Resources& totalResources,
-      const Filters& filters,
-      const process::Future<std::list<process::Future<bool>>>& authorizations);
+  // Add the task and its executor (if not already running) to the
+  // framework and slave. Returns the resources consumed as a result,
+  // which includes resources for the task and its executor
+  // (if not already running).
+  Resources addTask(const TaskInfo& task, Framework* framework, Slave* slave);
 
   // Transitions the task, and recovers resources if the task becomes
   // terminal.
@@ -391,6 +392,14 @@ protected:
       Slave* slave,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
+
+  // Updates slave's resources by applying the given operation. It
+  // also updates the allocator and sends a CheckpointResourcesMessage
+  // to the slave with slave's current checkpointed resources.
+  void applyOfferOperation(
+      Framework* framework,
+      Slave* slave,
+      const Offer::Operation& operation);
 
   // Forwards the update to the framework.
   void forward(
@@ -415,6 +424,37 @@ protected:
   Option<Credentials> credentials;
 
 private:
+  void drop(
+      const process::UPID& from,
+      const scheduler::Call& call,
+      const std::string& message);
+
+  void drop(
+      Framework* framework,
+      const Offer::Operation& operation,
+      const std::string& message);
+
+  // Call handlers.
+  void receive(
+      const process::UPID& from,
+      const scheduler::Call& call);
+
+  void accept(
+      Framework* framework,
+      const scheduler::Call::Accept& accept);
+
+  void _accept(
+    const FrameworkID& frameworkId,
+    const SlaveID& slaveId,
+    const Resources& offeredResources,
+    const scheduler::Call::Accept& accept,
+    const process::Future<std::list<process::Future<bool>>>& authorizations);
+
+  bool elected() const
+  {
+    return leader.isSome() && leader.get() == info_;
+  }
+
   // Inner class used to namespace HTTP route handlers (see
   // master/http.cpp for implementations).
   class Http
@@ -442,6 +482,10 @@ private:
     process::Future<process::http::Response> shutdown(
         const process::http::Request& request);
 
+    // /master/slaves
+    process::Future<process::http::Response> slaves(
+        const process::http::Request& request);
+
     // /master/state.json
     process::Future<process::http::Response> state(
         const process::http::Request& request);
@@ -458,6 +502,7 @@ private:
     const static std::string OBSERVE_HELP;
     const static std::string REDIRECT_HELP;
     const static std::string SHUTDOWN_HELP;
+    const static std::string SLAVES_HELP;
     const static std::string TASKS_HELP;
 
   private:
@@ -477,18 +522,20 @@ private:
   Master(const Master&);              // No copying.
   Master& operator = (const Master&); // No assigning.
 
-  friend struct OfferVisitor;
   friend struct Metrics;
+
+  // NOTE: Since 'getOffer' and 'getSlave' are protected, we need to
+  // make the following functions friends so that validation functions
+  // can get Offer* and Slave*.
+  friend Offer* validation::offer::getOffer(
+      Master* master, const OfferID& offerId);
+
+  friend Slave* validation::offer::getSlave(
+      Master* master, const SlaveID& slaveId);
 
   const Flags flags;
 
   Option<MasterInfo> leader; // Current leading master.
-
-  // Whether we are the current leading master.
-  bool elected() const
-  {
-    return leader.isSome() && leader.get() == info_;
-  }
 
   allocator::Allocator* allocator;
   WhitelistWatcher* whitelistWatcher;
@@ -545,6 +592,12 @@ private:
     // TODO(bmahler): Ideally we could use a cache with set semantics.
     Cache<SlaveID, Nothing> removed;
 
+    // This rate limiter is used to limit the removal of slaves failing
+    // health checks.
+    // NOTE: Using a 'shared_ptr' here is OK because 'RateLimiter' is
+    // a wrapper around libprocess process which is thread safe.
+    Option<memory::shared_ptr<process::RateLimiter>> limiter;
+
     bool transitioning(const Option<SlaveID>& slaveId)
     {
       if (slaveId.isSome()) {
@@ -576,6 +629,15 @@ private:
     //    allows them) if they have principals specified in
     //    FrameworkInfo.
     hashmap<process::UPID, Option<std::string>> principals;
+
+    // BoundedRateLimiters keyed by the framework principal.
+    // Like Metrics::Frameworks, all frameworks of the same principal
+    // are throttled together at a common rate limit.
+    hashmap<std::string, Option<process::Owned<BoundedRateLimiter>>> limiters;
+
+    // The default limiter is for frameworks not specified in
+    // 'flags.rate_limits'.
+    Option<process::Owned<BoundedRateLimiter>> defaultLimiter;
   } frameworks;
 
   hashmap<OfferID, Offer*> offers;
@@ -611,7 +673,11 @@ private:
     uint64_t invalidFrameworkMessages;
   } stats;
 
-  Metrics metrics;
+  // NOTE: It is safe to use a 'shared_ptr' because 'Metrics' is
+  // thread safe.
+  // TODO(dhamon): Does this need to be a shared_ptr? Metrics contains copyable
+  // metric types only.
+  memory::shared_ptr<Metrics> metrics;
 
   // Gauge handlers.
   double _uptime_secs()
@@ -673,31 +739,6 @@ private:
   process::Future<Option<Error>> validate(
       const FrameworkInfo& frameworkInfo,
       const process::UPID& from);
-
-  struct BoundedRateLimiter
-  {
-    BoundedRateLimiter(double qps, Option<uint64_t> _capacity)
-      : limiter(new process::RateLimiter(qps)),
-        capacity(_capacity),
-        messages(0) {}
-
-    process::Owned<process::RateLimiter> limiter;
-    const Option<uint64_t> capacity;
-
-    // Number of outstanding messages for this RateLimiter.
-    // NOTE: ExitedEvents are throttled but not counted towards
-    // the capacity here.
-    uint64_t messages;
-  };
-
-  // BoundedRateLimiters keyed by the framework principal.
-  // Like Metrics::Frameworks, all frameworks of the same principal
-  // are throttled together at a common rate limit.
-  hashmap<std::string, Option<process::Owned<BoundedRateLimiter>>> limiters;
-
-  // The default limiter is for frameworks not specified in
-  // 'flags.rate_limits'.
-  Option<process::Owned<BoundedRateLimiter>> defaultLimiter;
 };
 
 
@@ -707,6 +748,7 @@ struct Slave
         const process::UPID& _pid,
         const Option<std::string> _version,
         const process::Time& _registeredTime,
+        const Resources& _checkpointedResources,
         const std::vector<ExecutorInfo> executorInfos =
           std::vector<ExecutorInfo>(),
         const std::vector<Task> tasks =
@@ -718,9 +760,18 @@ struct Slave
       registeredTime(_registeredTime),
       connected(true),
       active(true),
+      checkpointedResources(_checkpointedResources),
       observer(NULL)
   {
     CHECK(_info.has_id());
+
+    Try<Resources> resources = applyCheckpointedResources(
+        info.resources(),
+        _checkpointedResources);
+
+    // NOTE: This should be validated during slave recovery.
+    CHECK_SOME(resources);
+    totalResources = resources.get();
 
     foreach (const ExecutorInfo& executorInfo, executorInfos) {
       CHECK(executorInfo.has_framework_id());
@@ -854,6 +905,15 @@ struct Slave
     }
   }
 
+  void apply(const Offer::Operation& operation)
+  {
+    Try<Resources> resources = totalResources.apply(operation);
+    CHECK_SOME(resources);
+
+    totalResources = resources.get();
+    checkpointedResources = totalResources.filter(needCheckpointing);
+  }
+
   const SlaveID id;
   const SlaveInfo info;
 
@@ -893,6 +953,17 @@ struct Slave
 
   hashmap<FrameworkID, Resources> usedResources;  // Active task / executors.
   Resources offeredResources; // Offers.
+
+  // Resources that should be checkpointed by the slave (e.g.,
+  // persistent volumes, dynamic reservations, etc). These are either
+  // in use by a task/executor, or are available for use and will be
+  // re-offered to the framework.
+  Resources checkpointedResources;
+
+  // The current total resources of the slave. Note that this is
+  // different from 'info.resources()' because this also consider
+  // operations (e.g., CREATE, RESERVE) that have been applied.
+  Resources totalResources;
 
   SlaveObserver* observer;
 
